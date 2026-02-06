@@ -11,4 +11,5 @@ wheels/
 
 *.v1i.yolov8
 *.v1i.yolov8.zip
-
+runs/*
+weed *

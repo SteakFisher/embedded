@@ -1,0 +1,8 @@
+path: weed crop 2.v1-primeraprueba.yolov8
+train: train/images
+val: val/images
+test: test/images
+
+nc: 1
+names:
+  - mal - v3 2022-06-03 9-35am

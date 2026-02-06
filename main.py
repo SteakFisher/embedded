@@ -3,7 +3,7 @@ from ultralytics import YOLO
 
 model = YOLO("yolov8n.pt")
 
-img = cv2.imread("plant5.jpg")
+img = cv2.imread("plant3.jpg")
 results = model(img, conf=0.05)
 
 for r in results:
