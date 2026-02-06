@@ -1,0 +1,9 @@
+path: crop weed.v1i.yolov8
+train: train/images
+val: val/images
+test: test/images
+
+nc: 2
+names:
+  - crop
+  - weed
