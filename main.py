@@ -249,7 +249,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="runs/detect/train5/weights/best.pt",
+        default="best.pt",
         help="Path to YOLO model weights (default: trained crop/weed model)",
     )
     parser.add_argument(
