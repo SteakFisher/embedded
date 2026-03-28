@@ -10,7 +10,7 @@ Usage:
   python main.py --source webcam
   python main.py --source video --input drone_footage.mp4
   python main.py --source images --input ./plant_images/
-  python main.py --source webcam --model yolov8n.pt --conf 0.5
+  python main.py --source webcam --model new.pt --conf 0.2
 
 Environment:
   IMAGE_UPLOAD_URL - Endpoint to send processed frames
@@ -27,20 +27,44 @@ import cv2
 import requests
 from ultralytics import YOLO
 
-# Class index -> (color_bgr, label)
-# Trained on plants.yaml: 0=crop, 1=weed
-CLASS_COLORS = {
-    0: ((0, 200, 0), "crop"),       # green
-    1: ((0, 0, 255), "weed"),       # red
+# Preferred colors for known semantic classes
+SEMANTIC_COLORS = {
+    "crop": (0, 200, 0),  # green
+    "weed": (0, 0, 255),  # red
 }
 
-# Fallback for unknown class indices
+# Fallback for any other class
 DEFAULT_COLOR = (255, 165, 0)  # orange (BGR)
 
 DEFAULT_UPLOAD_URL = os.getenv("IMAGE_UPLOAD_URL", "http://localhost:3001/upload")
 
 
-def draw_detections(frame, results):
+def resolve_class_name(class_names, cls_id):
+    """Return model class name for a class index, with safe fallback."""
+    if isinstance(class_names, dict):
+        return str(class_names.get(cls_id, f"class_{cls_id}"))
+
+    if isinstance(class_names, (list, tuple)) and 0 <= cls_id < len(class_names):
+        return str(class_names[cls_id])
+
+    return f"class_{cls_id}"
+
+
+def class_color(label, cls_id):
+    """Pick a display color for a class label."""
+    semantic = SEMANTIC_COLORS.get(label.strip().lower())
+    if semantic is not None:
+        return semantic
+
+    # Deterministic fallback color per class id
+    return (
+        (37 * cls_id + 80) % 256,
+        (17 * cls_id + 140) % 256,
+        (29 * cls_id + 200) % 256,
+    ) or DEFAULT_COLOR
+
+
+def draw_detections(frame, results, class_names):
     """Draw bounding boxes with class labels and confidence scores."""
     for r in results:
         for box in r.boxes:
@@ -48,7 +72,8 @@ def draw_detections(frame, results):
             cls_id = int(box.cls[0])
             conf = float(box.conf[0])
 
-            color, label = CLASS_COLORS.get(cls_id, (DEFAULT_COLOR, f"class_{cls_id}"))
+            label = resolve_class_name(class_names, cls_id)
+            color = class_color(label, cls_id)
 
             # Draw bounding box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -57,8 +82,16 @@ def draw_detections(frame, results):
             text = f"{label} {conf:.2f}"
             (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
             cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(frame, text, (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                text,
+                (x1 + 2, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     return frame
 
@@ -66,16 +99,32 @@ def draw_detections(frame, results):
 def draw_fps(frame, fps):
     """Draw FPS counter in the top-left corner."""
     text = f"FPS: {fps:.1f}"
-    cv2.putText(frame, text, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        text,
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def draw_status(frame, text):
     """Draw a status bar at the bottom of the frame."""
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, h - 35), (w, h), (40, 40, 40), -1)
-    cv2.putText(frame, text, (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        text,
+        (10, h - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def upload_frame(frame, upload_url, source_tag):
@@ -131,7 +180,7 @@ def run_webcam(model, conf, upload_url):
 
         fps = 1.0 / max(t_end - t_start, 1e-9)
 
-        frame = draw_detections(frame, results)
+        frame = draw_detections(frame, results, model.names)
         draw_fps(frame, fps)
         draw_status(frame, f"[WEBCAM] Frame {frame_num} | upload=1fps")
 
@@ -181,7 +230,7 @@ def run_video(model, conf, video_path, upload_url):
 
         fps = 1.0 / max(t_end - t_start, 1e-9)
 
-        frame = draw_detections(frame, results)
+        frame = draw_detections(frame, results, model.names)
         draw_fps(frame, fps)
         draw_status(frame, f"[VIDEO] Frame {frame_num}/{total_frames} | upload=1fps")
 
@@ -234,10 +283,10 @@ def run_images(model, conf, image_dir, upload_url):
 
         inference_ms = (t_end - t_start) * 1000
 
-        frame = draw_detections(frame, results)
+        frame = draw_detections(frame, results, model.names)
         draw_status(
             frame,
-            f"[IMAGES] {idx + 1}/{len(image_paths)} {img_path.name} | {inference_ms:.0f}ms | upload=5s"
+            f"[IMAGES] {idx + 1}/{len(image_paths)} {img_path.name} | {inference_ms:.0f}ms | upload=5s",
         )
 
         upload_frame(frame, upload_url, f"IMAGES #{idx + 1} {img_path.name}")
