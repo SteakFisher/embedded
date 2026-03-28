@@ -474,7 +474,9 @@ def run_images(model, conf, image_dir, upload_url):
         if frame is None:
             print(f"Warning: Could not read {img_path}, skipping.")
             idx = (idx + 1) % len(image_paths)
-            time.sleep(5)
+            elapsed = time.perf_counter() - cycle_start
+            sleep_time = max(0.0, 5.0 - elapsed)
+            time.sleep(sleep_time)
             continue
 
         t_start = time.perf_counter()
