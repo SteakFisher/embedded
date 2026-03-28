@@ -11,6 +11,8 @@ Usage:
   python main.py --source video --input drone_footage.mp4
   python main.py --source images --input ./plant_images/
   python main.py --source webcam --model new.pt --conf 0.2
+  python main.py --source webcam --camera-mode auto --model new.pt --conf 0.2
+
 
 Environment:
   IMAGE_UPLOAD_URL - Endpoint to send processed frames
@@ -18,14 +20,19 @@ Environment:
 """
 
 import argparse
+import importlib
+import importlib.util
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import cv2
 import requests
-from ultralytics import YOLO
+import ultralytics
+
+PICAMERA2_AVAILABLE = importlib.util.find_spec("picamera2") is not None
 
 # Preferred colors for known semantic classes
 SEMANTIC_COLORS = {
@@ -153,44 +160,121 @@ def upload_frame(frame, upload_url, source_tag):
     return False
 
 
-def run_webcam(model, conf, upload_url):
-    """Run webcam detection and upload at 1 FPS."""
-    cap = cv2.VideoCapture(0)
+def init_opencv_camera(camera_index):
+    """Initialize OpenCV camera capture."""
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        return None
+    return cap
+
+
+def init_picamera2_camera():
+    """Initialize Picamera2 camera capture for Raspberry Pi CSI cameras."""
+    if not PICAMERA2_AVAILABLE:
+        return None
+
+    picamera2_module = importlib.import_module("picamera2")
+    picam2_class = picamera2_module.Picamera2
+    picam2 = picam2_class()
+    config = picam2.create_preview_configuration(
+        main={"size": (1280, 720), "format": "RGB888"}
+    )
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(0.5)
+    return picam2
+
+
+def run_webcam(model, conf, upload_url, camera_mode="auto", camera_index=0):
+    """Run webcam/camera detection and upload at 1 FPS."""
+    backend = None
+    cap = None
+    picam2: Any = None
+
+    if camera_mode in ("desktop", "auto"):
+        cap = init_opencv_camera(camera_index)
+        if cap is not None:
+            backend = "desktop"
+        elif camera_mode == "desktop":
+            print(f"Error: Could not open desktop webcam at index {camera_index}.")
+            sys.exit(1)
+
+    if backend is None and camera_mode in ("raspi", "auto"):
+        try:
+            picam2 = init_picamera2_camera()
+        except Exception as exc:
+            picam2 = None
+            if camera_mode == "raspi":
+                print(f"Error: Failed to initialize Raspberry Pi camera: {exc}")
+                sys.exit(1)
+
+        if picam2 is not None:
+            backend = "raspi"
+        elif camera_mode == "raspi":
+            print("Error: Picamera2 is not available or camera could not be started.")
+            print("Install with: sudo apt install -y python3-picamera2")
+            sys.exit(1)
+
+    if backend is None:
+        print("Error: No usable camera backend found.")
+        print("Try --camera-mode desktop for USB webcam or --camera-mode raspi for CSI camera.")
+        if not PICAMERA2_AVAILABLE:
+            print("Tip: Install Picamera2 on Raspberry Pi with: sudo apt install -y python3-picamera2")
         sys.exit(1)
 
-    print(f"Webcam opened. Uploading processed frames to: {upload_url}")
+    print(f"Camera backend: {backend}")
+    print(f"Camera opened. Uploading processed frames to: {upload_url}")
     print("Mode: webcam | Rate: 1 FPS")
 
     frame_num = 0
-    while True:
-        cycle_start = time.perf_counter()
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Failed to read frame from webcam.")
-            time.sleep(1)
-            continue
+    try:
+        while True:
+            cycle_start = time.perf_counter()
 
-        frame_num += 1
+            if backend == "desktop":
+                if cap is None:
+                    print("Error: Desktop camera backend was not initialized.")
+                    time.sleep(1)
+                    continue
+                ret, frame = cap.read()
+                if not ret:
+                    print("Error: Failed to read frame from desktop webcam.")
+                    time.sleep(1)
+                    continue
+            else:
+                if picam2 is None:
+                    print("Error: Raspberry Pi camera backend was not initialized.")
+                    time.sleep(1)
+                    continue
+                frame_rgb = picam2.capture_array()
+                if frame_rgb is None:
+                    print("Error: Failed to read frame from Raspberry Pi camera.")
+                    time.sleep(1)
+                    continue
+                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-        t_start = time.perf_counter()
-        results = model(frame, conf=conf, verbose=False)
-        t_end = time.perf_counter()
+            frame_num += 1
 
-        fps = 1.0 / max(t_end - t_start, 1e-9)
+            t_start = time.perf_counter()
+            results = model(frame, conf=conf, verbose=False)
+            t_end = time.perf_counter()
 
-        frame = draw_detections(frame, results, model.names)
-        draw_fps(frame, fps)
-        draw_status(frame, f"[WEBCAM] Frame {frame_num} | upload=1fps")
+            fps = 1.0 / max(t_end - t_start, 1e-9)
 
-        upload_frame(frame, upload_url, f"WEBCAM #{frame_num}")
+            frame = draw_detections(frame, results, model.names)
+            draw_fps(frame, fps)
+            draw_status(frame, f"[WEBCAM/{backend.upper()}] Frame {frame_num} | upload=1fps")
 
-        elapsed = time.perf_counter() - cycle_start
-        sleep_time = max(0.0, 1.0 - elapsed)
-        time.sleep(sleep_time)
+            upload_frame(frame, upload_url, f"WEBCAM/{backend.upper()} #{frame_num}")
 
-    cap.release()
+            elapsed = time.perf_counter() - cycle_start
+            sleep_time = max(0.0, 1.0 - elapsed)
+            time.sleep(sleep_time)
+    finally:
+        if cap is not None:
+            cap.release()
+        if picam2 is not None:
+            picam2.stop()
 
 
 def run_video(model, conf, video_path, upload_url):
@@ -338,6 +422,22 @@ def main():
             "(default from IMAGE_UPLOAD_URL env or http://localhost:3001/upload)"
         ),
     )
+    parser.add_argument(
+        "--camera-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "desktop", "raspi"],
+        help=(
+            "Camera backend for --source webcam: "
+            "auto (try desktop then raspi), desktop (OpenCV webcam), raspi (Picamera2 CSI)"
+        ),
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="Camera index for desktop mode (default: 0)",
+    )
 
     args = parser.parse_args()
 
@@ -355,7 +455,8 @@ def main():
 
     # Load model
     print(f"Loading model: {args.model}")
-    model = YOLO(args.model)
+    yolo_class = getattr(ultralytics, "YOLO")
+    model = yolo_class(args.model)
 
     # Print class names from the loaded model
     if hasattr(model, "names"):
@@ -365,12 +466,21 @@ def main():
     print()
 
     # Dispatch to the appropriate mode
-    if args.source == "webcam":
-        run_webcam(model, args.conf, args.upload_url)
-    elif args.source == "video":
-        run_video(model, args.conf, args.input, args.upload_url)
-    elif args.source == "images":
-        run_images(model, args.conf, args.input, args.upload_url)
+    try:
+        if args.source == "webcam":
+            run_webcam(
+                model,
+                args.conf,
+                args.upload_url,
+                camera_mode=args.camera_mode,
+                camera_index=args.camera_index,
+            )
+        elif args.source == "video":
+            run_video(model, args.conf, args.input, args.upload_url)
+        elif args.source == "images":
+            run_images(model, args.conf, args.input, args.upload_url)
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
 
 
 if __name__ == "__main__":
