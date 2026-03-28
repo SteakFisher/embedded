@@ -2,9 +2,9 @@
 Agricultural Weed Detection - Local Testing Environment
 
 Supports three input modes for testing the crop/weed detection model:
-  - webcam:  Live camera feed (simulates drone camera)
-  - video:   Process a video file frame by frame
-  - images:  Iterate through a directory of images
+  - webcam:  Process webcam frames and upload at 1 FPS
+  - video:   Process video frames and upload at 1 FPS
+  - images:  Process directory images and upload every 5 seconds
 
 Usage:
   python main.py --source webcam
@@ -12,19 +12,19 @@ Usage:
   python main.py --source images --input ./plant_images/
   python main.py --source webcam --model yolov8n.pt --conf 0.5
 
-Controls:
-  q     - Quit
-  n     - Next image (images mode)
-  p     - Previous image (images mode)
-  SPACE - Pause/resume (video mode)
+Environment:
+  IMAGE_UPLOAD_URL - Endpoint to send processed frames
+                     (default: http://localhost:3001/upload)
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 import cv2
+import requests
 from ultralytics import YOLO
 
 # Class index -> (color_bgr, label)
@@ -36,6 +36,8 @@ CLASS_COLORS = {
 
 # Fallback for unknown class indices
 DEFAULT_COLOR = (255, 165, 0)  # orange (BGR)
+
+DEFAULT_UPLOAD_URL = os.getenv("IMAGE_UPLOAD_URL", "http://localhost:3001/upload")
 
 
 def draw_detections(frame, results):
@@ -76,20 +78,52 @@ def draw_status(frame, text):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
 
 
-def run_webcam(model, conf):
-    """Run real-time detection on webcam feed."""
+def upload_frame(frame, upload_url, source_tag):
+    """Encode frame as JPEG and upload to backend."""
+    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        print(f"[{source_tag}] Failed to encode frame as JPEG.")
+        return False
+
+    try:
+        response = requests.post(
+            upload_url,
+            data=encoded.tobytes(),
+            headers={"Content-Type": "image/jpeg"},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        print(f"[{source_tag}] Upload failed: {exc}")
+        return False
+
+    if response.ok:
+        print(f"[{source_tag}] Uploaded frame ({response.status_code})")
+        return True
+
+    print(f"[{source_tag}] Upload error {response.status_code}: {response.text}")
+    return False
+
+
+def run_webcam(model, conf, upload_url):
+    """Run webcam detection and upload at 1 FPS."""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Could not open webcam.")
         sys.exit(1)
 
-    print("Webcam opened. Press 'q' to quit.")
+    print(f"Webcam opened. Uploading processed frames to: {upload_url}")
+    print("Mode: webcam | Rate: 1 FPS")
 
+    frame_num = 0
     while True:
+        cycle_start = time.perf_counter()
         ret, frame = cap.read()
         if not ret:
             print("Error: Failed to read frame from webcam.")
-            break
+            time.sleep(1)
+            continue
+
+        frame_num += 1
 
         t_start = time.perf_counter()
         results = model(frame, conf=conf, verbose=False)
@@ -99,18 +133,19 @@ def run_webcam(model, conf):
 
         frame = draw_detections(frame, results)
         draw_fps(frame, fps)
-        draw_status(frame, "[WEBCAM] Press 'q' to quit")
+        draw_status(frame, f"[WEBCAM] Frame {frame_num} | upload=1fps")
 
-        cv2.imshow("Weed Detection - Webcam", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        upload_frame(frame, upload_url, f"WEBCAM #{frame_num}")
+
+        elapsed = time.perf_counter() - cycle_start
+        sleep_time = max(0.0, 1.0 - elapsed)
+        time.sleep(sleep_time)
 
     cap.release()
-    cv2.destroyAllWindows()
 
 
-def run_video(model, conf, video_path):
-    """Run detection on a video file frame by frame."""
+def run_video(model, conf, video_path, upload_url):
+    """Run detection on a video file and upload at 1 FPS."""
     if not Path(video_path).is_file():
         print(f"Error: Video file not found: {video_path}")
         sys.exit(1)
@@ -122,51 +157,45 @@ def run_video(model, conf, video_path):
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_delay = int(1000 / video_fps)
 
-    print(f"Video: {video_path} ({total_frames} frames, {video_fps:.1f} FPS)")
-    print("Press 'q' to quit, SPACE to pause/resume.")
+    print(f"Video: {video_path} ({total_frames} frames, {video_fps:.1f} FPS source)")
+    print(f"Uploading processed frames to: {upload_url}")
+    print("Mode: video | Rate: 1 FPS | Loops when video ends")
 
-    paused = False
     frame_num = 0
 
     while True:
-        if not paused:
-            ret, frame = cap.read()
-            if not ret:
-                print("End of video.")
-                break
+        cycle_start = time.perf_counter()
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            frame_num = 0
+            print("Reached end of video. Restarting from frame 1.")
+            continue
 
-            frame_num += 1
+        frame_num += 1
 
-            t_start = time.perf_counter()
-            results = model(frame, conf=conf, verbose=False)
-            t_end = time.perf_counter()
+        t_start = time.perf_counter()
+        results = model(frame, conf=conf, verbose=False)
+        t_end = time.perf_counter()
 
-            fps = 1.0 / max(t_end - t_start, 1e-9)
+        fps = 1.0 / max(t_end - t_start, 1e-9)
 
-            frame = draw_detections(frame, results)
-            draw_fps(frame, fps)
-            draw_status(frame, f"[VIDEO] Frame {frame_num}/{total_frames} | SPACE=pause  q=quit")
+        frame = draw_detections(frame, results)
+        draw_fps(frame, fps)
+        draw_status(frame, f"[VIDEO] Frame {frame_num}/{total_frames} | upload=1fps")
 
-            cv2.imshow("Weed Detection - Video", frame)
+        upload_frame(frame, upload_url, f"VIDEO #{frame_num}")
 
-        key = cv2.waitKey(frame_delay if not paused else 50) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord(" "):
-            paused = not paused
-            if paused:
-                print(f"Paused at frame {frame_num}/{total_frames}")
-            else:
-                print("Resumed.")
+        elapsed = time.perf_counter() - cycle_start
+        sleep_time = max(0.0, 1.0 - elapsed)
+        time.sleep(sleep_time)
 
     cap.release()
-    cv2.destroyAllWindows()
 
 
-def run_images(model, conf, image_dir):
-    """Run detection on a directory of images with navigation."""
+def run_images(model, conf, image_dir, upload_url):
+    """Run detection on a directory and upload one image every 5 seconds."""
     img_dir = Path(image_dir)
     if not img_dir.is_dir():
         print(f"Error: Directory not found: {image_dir}")
@@ -182,55 +211,42 @@ def run_images(model, conf, image_dir):
         sys.exit(1)
 
     print(f"Found {len(image_paths)} images in {image_dir}")
-    print("Press 'n' for next, 'p' for previous, 'q' to quit.")
+    print(f"Uploading processed images to: {upload_url}")
+    print("Mode: images | Rate: 1 image every 5 seconds | Loops forever")
 
     idx = 0
-    cached_frame = None
-    last_idx = -1
 
     while True:
-        if idx != last_idx:
-            img_path = image_paths[idx]
-            frame = cv2.imread(str(img_path))
+        cycle_start = time.perf_counter()
 
-            if frame is None:
-                print(f"Warning: Could not read {img_path}, skipping.")
-                idx = min(idx + 1, len(image_paths) - 1)
-                continue
+        img_path = image_paths[idx]
+        frame = cv2.imread(str(img_path))
 
-            t_start = time.perf_counter()
-            results = model(frame, conf=conf, verbose=False)
-            t_end = time.perf_counter()
+        if frame is None:
+            print(f"Warning: Could not read {img_path}, skipping.")
+            idx = (idx + 1) % len(image_paths)
+            time.sleep(5)
+            continue
 
-            inference_ms = (t_end - t_start) * 1000
+        t_start = time.perf_counter()
+        results = model(frame, conf=conf, verbose=False)
+        t_end = time.perf_counter()
 
-            frame = draw_detections(frame, results)
-            draw_status(
-                frame,
-                f"[{idx + 1}/{len(image_paths)}] {img_path.name} | "
-                f"{inference_ms:.0f}ms | n=next  p=prev  q=quit"
-            )
+        inference_ms = (t_end - t_start) * 1000
 
-            cached_frame = frame
-            last_idx = idx
+        frame = draw_detections(frame, results)
+        draw_status(
+            frame,
+            f"[IMAGES] {idx + 1}/{len(image_paths)} {img_path.name} | {inference_ms:.0f}ms | upload=5s"
+        )
 
-        cv2.imshow("Weed Detection - Images", cached_frame)
+        upload_frame(frame, upload_url, f"IMAGES #{idx + 1} {img_path.name}")
 
-        key = cv2.waitKey(50) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("n"):
-            if idx < len(image_paths) - 1:
-                idx += 1
-            else:
-                print("Already at last image.")
-        elif key == ord("p"):
-            if idx > 0:
-                idx -= 1
-            else:
-                print("Already at first image.")
+        idx = (idx + 1) % len(image_paths)
 
-    cv2.destroyAllWindows()
+        elapsed = time.perf_counter() - cycle_start
+        sleep_time = max(0.0, 5.0 - elapsed)
+        time.sleep(sleep_time)
 
 
 def main():
@@ -264,6 +280,15 @@ def main():
         default=None,
         help="Path to video file or image directory (required for video/images mode)",
     )
+    parser.add_argument(
+        "--upload-url",
+        type=str,
+        default=DEFAULT_UPLOAD_URL,
+        help=(
+            "Endpoint to upload processed frames "
+            "(default from IMAGE_UPLOAD_URL env or http://localhost:3001/upload)"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -287,15 +312,16 @@ def main():
     if hasattr(model, "names"):
         print(f"Classes: {model.names}")
     print(f"Confidence threshold: {args.conf}")
+    print(f"Upload URL: {args.upload_url}")
     print()
 
     # Dispatch to the appropriate mode
     if args.source == "webcam":
-        run_webcam(model, args.conf)
+        run_webcam(model, args.conf, args.upload_url)
     elif args.source == "video":
-        run_video(model, args.conf, args.input)
+        run_video(model, args.conf, args.input, args.upload_url)
     elif args.source == "images":
-        run_images(model, args.conf, args.input)
+        run_images(model, args.conf, args.input, args.upload_url)
 
 
 if __name__ == "__main__":
