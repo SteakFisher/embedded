@@ -11,7 +11,7 @@ Usage:
   python main.py --source video --input drone_footage.mp4
   python main.py --source images --input ./plant_images/
   python main.py --source webcam --model new.pt --conf 0.2
-  python main.py --source webcam --camera-mode auto --model new.pt --conf 0.2
+  python main.py --source webcam --camera-mode rpicam --model new.pt --conf 0.2
 
 
 Environment:
@@ -23,12 +23,15 @@ import argparse
 import importlib
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import requests
 import ultralytics
 
@@ -185,18 +188,98 @@ def init_picamera2_camera():
     return picam2
 
 
+def init_rpicam_camera(width=1280, height=720, framerate=30):
+    """Initialize rpicam-vid subprocess for MJPEG streaming to stdout."""
+    exe = shutil.which("rpicam-vid")
+    if exe is None:
+        return None
+
+    cmd = [
+        exe,
+        "--codec",
+        "mjpeg",
+        "-t",
+        "0",
+        "-n",
+        "--inline",
+        "--width",
+        str(width),
+        "--height",
+        str(height),
+        "--framerate",
+        str(framerate),
+        "-o",
+        "-",
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+    except OSError:
+        return None
+
+    time.sleep(0.3)
+    if proc.poll() is not None:
+        return None
+
+    return proc
+
+
+def read_rpicam_mjpeg_frame(proc, frame_buffer):
+    """Read and decode one MJPEG frame from rpicam-vid stdout."""
+    if proc.stdout is None:
+        return None
+
+    chunk = proc.stdout.read(65536)
+    if not chunk:
+        return None
+    frame_buffer.extend(chunk)
+
+    soi = frame_buffer.find(b"\xff\xd8")
+    eoi = frame_buffer.find(b"\xff\xd9", max(0, soi + 2)) if soi != -1 else -1
+
+    if soi == -1 or eoi == -1:
+        if len(frame_buffer) > 4 * 1024 * 1024:
+            del frame_buffer[:-2]
+        return None
+
+    jpeg_bytes = bytes(frame_buffer[soi : eoi + 2])
+    del frame_buffer[: eoi + 2]
+
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return frame
+
+
 def run_webcam(model, conf, upload_url, camera_mode="auto", camera_index=0):
     """Run webcam/camera detection and upload at 1 FPS."""
     backend = None
     cap = None
     picam2: Any = None
+    rpicam_proc = None
+    rpicam_buffer = bytearray()
 
     if camera_mode in ("desktop", "auto"):
         cap = init_opencv_camera(camera_index)
         if cap is not None:
             backend = "desktop"
+            print(f"Using desktop camera at index {camera_index}.")
         elif camera_mode == "desktop":
             print(f"Error: Could not open desktop webcam at index {camera_index}.")
+            sys.exit(1)
+
+    if backend is None and camera_mode in ("rpicam", "auto"):
+        rpicam_proc = init_rpicam_camera()
+        if rpicam_proc is not None:
+            backend = "rpicam"
+            print("Using Raspberry Pi rpicam-vid MJPEG stream.")
+        elif camera_mode == "rpicam":
+            print("Error: Could not start rpicam-vid camera stream.")
+            print("Tip: Verify camera with: rpicam-hello --list-cameras")
             sys.exit(1)
 
     if backend is None and camera_mode in ("raspi", "auto"):
@@ -210,6 +293,7 @@ def run_webcam(model, conf, upload_url, camera_mode="auto", camera_index=0):
 
         if picam2 is not None:
             backend = "raspi"
+            print("Using Raspberry Pi Picamera2 backend.")
         elif camera_mode == "raspi":
             print("Error: Picamera2 is not available or camera could not be started.")
             print("Install with: sudo apt install -y python3-picamera2")
@@ -217,9 +301,14 @@ def run_webcam(model, conf, upload_url, camera_mode="auto", camera_index=0):
 
     if backend is None:
         print("Error: No usable camera backend found.")
-        print("Try --camera-mode desktop for USB webcam or --camera-mode raspi for CSI camera.")
+        print(
+            "Try --camera-mode desktop for USB webcam, --camera-mode rpicam for CSI camera, "
+            "or --camera-mode raspi for Picamera2."
+        )
         if not PICAMERA2_AVAILABLE:
-            print("Tip: Install Picamera2 on Raspberry Pi with: sudo apt install -y python3-picamera2")
+            print(
+                "Tip: Install Picamera2 on Raspberry Pi with: sudo apt install -y python3-picamera2"
+            )
         sys.exit(1)
 
     print(f"Camera backend: {backend}")
@@ -240,6 +329,24 @@ def run_webcam(model, conf, upload_url, camera_mode="auto", camera_index=0):
                 if not ret:
                     print("Error: Failed to read frame from desktop webcam.")
                     time.sleep(1)
+                    continue
+            elif backend == "rpicam":
+                if rpicam_proc is None:
+                    print("Error: rpicam backend was not initialized.")
+                    time.sleep(1)
+                    continue
+                if rpicam_proc.poll() is not None:
+                    print("Error: rpicam-vid process exited unexpectedly.")
+                    if rpicam_proc.stderr is not None:
+                        stderr_sample = rpicam_proc.stderr.read(2048)
+                        if stderr_sample:
+                            print(
+                                f"rpicam-vid: {stderr_sample.decode(errors='ignore').strip()}"
+                            )
+                    time.sleep(1)
+                    continue
+                frame = read_rpicam_mjpeg_frame(rpicam_proc, rpicam_buffer)
+                if frame is None:
                     continue
             else:
                 if picam2 is None:
@@ -263,7 +370,9 @@ def run_webcam(model, conf, upload_url, camera_mode="auto", camera_index=0):
 
             frame = draw_detections(frame, results, model.names)
             draw_fps(frame, fps)
-            draw_status(frame, f"[WEBCAM/{backend.upper()}] Frame {frame_num} | upload=1fps")
+            draw_status(
+                frame, f"[WEBCAM/{backend.upper()}] Frame {frame_num} | upload=1fps"
+            )
 
             upload_frame(frame, upload_url, f"WEBCAM/{backend.upper()} #{frame_num}")
 
@@ -273,6 +382,13 @@ def run_webcam(model, conf, upload_url, camera_mode="auto", camera_index=0):
     finally:
         if cap is not None:
             cap.release()
+        if rpicam_proc is not None:
+            if rpicam_proc.poll() is None:
+                rpicam_proc.terminate()
+                try:
+                    rpicam_proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    rpicam_proc.kill()
         if picam2 is not None:
             picam2.stop()
 
@@ -426,10 +542,11 @@ def main():
         "--camera-mode",
         type=str,
         default="auto",
-        choices=["auto", "desktop", "raspi"],
+        choices=["auto", "desktop", "rpicam", "raspi"],
         help=(
             "Camera backend for --source webcam: "
-            "auto (try desktop then raspi), desktop (OpenCV webcam), raspi (Picamera2 CSI)"
+            "auto (try desktop, then rpicam, then raspi), desktop (OpenCV webcam), "
+            "rpicam (rpicam-vid MJPEG), raspi (Picamera2 CSI)"
         ),
     )
     parser.add_argument(
